@@ -5,7 +5,7 @@ use crate::{app::{ApplicationData, HashSubmittion, BestSolution, StoredJob}, pac
 
 type AppData = web::Data<Arc<Mutex<ApplicationData>>>;
 
-const MINIMUN_ZERO_BIT_LENGTH: u8 = 26;
+const MINIMUN_ZERO_BIT_LENGTH: u8 = 34;
 
 #[get("/")]
 pub async fn index(data: AppData) -> impl Responder {
