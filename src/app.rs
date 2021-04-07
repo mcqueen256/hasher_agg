@@ -2,8 +2,10 @@ use std::collections::HashMap;
 use crate::packets::{Job, Solution};
 use serde::Deserialize;
 use serde::Serialize;
+use std::fs::OpenOptions;
+use std::path::Path;
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Machine {
     pub name: String,
     pub reported_thread_hashrate: f64,
@@ -19,13 +21,13 @@ pub struct Submitter {
     pub student_number: String,
     pub next_job_number: u64,
     pub next_nounce: u64,
-    pub pending_jobs: Vec<Job>,
-    pub unfinished_jobs: Vec<Job>,
-    pub accepted_shares: Vec<Solution>,
-    pub rejected_shares: Vec<Solution>,
+    pub pending_jobs: Vec<StoredJob>,
+    pub unfinished_jobs: Vec<StoredJob>,
+    pub accepted_shares_count: u64,
     pub machines: Vec<Machine>,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, Copy)]
 pub struct StoredJob {
     pub number: u64,
     pub size: u64,
@@ -35,18 +37,26 @@ pub struct StoredJob {
 }
 
 impl Submitter {
-
     pub fn new(student_number: &str) -> Self {
-        Self {
+        let path = &format!("{}/data/submitters/{}/info.json", get_cwd(), student_number);
+        let open_path = &format!("{}/data/submitters/{}", get_cwd(), student_number);
+        if Path::new(path).exists() {
+            if let Ok(file) = open_read_file(open_path, "info.json") {
+                return serde_json::from_reader(&file).expect("Could not interpret json");
+            }
+        }
+        
+        let submitter = Self {
             machines: vec![],
             next_job_number: 0,
             pending_jobs: vec![],
             unfinished_jobs: vec![],
-            accepted_shares: vec![],
-            rejected_shares: vec![],
+            accepted_shares_count: 0,
             next_nounce: 0,
             student_number: String::from(student_number),
-        }
+        };
+        submitter.save();
+        submitter
     }
 
     /// Returns the machine with the given name. If no machine exists, a new one is made.
@@ -77,12 +87,31 @@ impl Submitter {
             machines.push(machine);
             machines.last_mut().unwrap()
         }
+
     }
 
     pub fn next_job(&mut self, name: &str) -> Job {
+        // Check if we need to add old jobs to the unfinished list.
+        let mut old_job_indexes = vec![];
+        for (i, pending) in self.pending_jobs.iter().enumerate() {
+            let age = crate::util::get_time() - pending.quote_time;
+            if age > 10.0*60.0 {
+                old_job_indexes.push(i);
+            }
+        }
+        // Move old jobs to unfinished.
+        for &index in old_job_indexes.iter().rev() {
+            self.unfinished_jobs.push(self.pending_jobs.remove(index));
+        }
         // If there are jobs that have not been processed, then process them.
         if let Some(job) = self.unfinished_jobs.pop() {
             self.pending_jobs.push(job.clone());
+            let job = Job {
+                number: job.number,
+                nounce_start: job.nounce_start,
+                nounce_end: job.nounce_end,
+                size: job.size,
+            };
             return job;
         }
         // Make new job.
@@ -93,13 +122,21 @@ impl Submitter {
         let nounce_start = self.next_nounce;
         let nounce_end = nounce_start + size;
         self.next_nounce = nounce_end;
-        let job = Job {
+        let job = StoredJob {
             number,
             size,
             nounce_start,
             nounce_end,
+            quote_time: crate::util::get_time(),
         };
         self.pending_jobs.push(job.clone());
+
+        let job = Job {
+            number: job.number,
+            nounce_start: job.nounce_start,
+            nounce_end: job.nounce_end,
+            size: job.size,
+        };
         return job;
     }
 
@@ -112,7 +149,14 @@ impl Submitter {
             }
         }
         if let Some(index) = some_index {
-            Ok(self.pending_jobs.remove(index))
+            let job = self.pending_jobs.remove(index);
+            let job = Job {
+                number: job.number,
+                nounce_start: job.nounce_start,
+                nounce_end: job.nounce_end,
+                size: job.size,
+            };
+            Ok(job)
         } else {
             Err(())
         }
@@ -125,9 +169,29 @@ impl Submitter {
         }
         sum / self.machines.len() as f64
     }
+
+    pub fn save(&self) {
+        let file  = open_overwrite_file(
+        &format!("submitters/{}", self.student_number),
+        "info.json"
+        ).expect("Could not open/overwrite submitters, info JSON file.");
+        serde_json::to_writer(&file, &self)
+        .expect(&format!("Counld not write JSON to submitters/{}/info.json", self.student_number));
+    }
+
+    pub fn save_solution(&self, solution: Solution, leading_zero_bits_length: u8) {
+        let file  = open_append_file(
+            &format!("submitters/{}", self.student_number),
+            &format!("sol_{:02}", leading_zero_bits_length),
+            ).expect("Could not open/append submitters solution file.");
+        serde_json::to_writer(&file, &solution)
+            .expect("Counld not write JSON to submitters solution file");
+        use std::io::Write;
+        writeln!(&file, "").expect("Counld not write line JSON to submitters solution file");
+    }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct BestSolution {
     pub student_number: String,
     pub job_number: u64,
@@ -136,10 +200,9 @@ pub struct BestSolution {
     pub hash: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug)]
 pub struct ApplicationData {
     pub submitters: HashMap<String, Submitter>,
-    pub hashes: Vec<String>,
     pub best: Option<BestSolution>,
 }
 
@@ -151,10 +214,33 @@ pub enum HashSubmittion {
 
 impl ApplicationData {
     pub fn begin() -> Self {
+        let mut best = None;
+        let mut submitters = HashMap::new();
+        if let Ok(file) = open_read_file("best", "best.json") {
+            if let Ok(best_from_file) = serde_json::from_reader(&file) {
+                best = Some(best_from_file);
+            }
+        }
+        let str_path = format!("{}/data/submitters", get_cwd());
+        if let Ok(paths) = std::fs::read_dir(&str_path) {
+            for path in  paths {
+                let path = path.unwrap().path();
+                let str_path = format!("{}", path.display());
+                let student_number = str_path.split("/").last().unwrap();
+                if let Ok(file) = open_read_file(
+                    &format!("submitters/{}", student_number),
+                    "info.json"
+                ) {
+                    if let Ok(submitter) = serde_json::from_reader(file) {
+                        submitters.insert(String::from(student_number), submitter);
+                    }
+                }
+
+            }
+        }
         ApplicationData {
-            submitters: HashMap::new(),
-            hashes: vec![],
-            best: None,
+            submitters,
+            best,
         }
     }
 
@@ -167,11 +253,66 @@ impl ApplicationData {
     }
 
     pub fn submit_hash(&mut self, hash: &String) -> HashSubmittion {
-        if self.hashes.contains(&hash) {
-            HashSubmittion::AlreadyExists
-        } else {
-            self.hashes.push(hash.clone());
-            HashSubmittion::Accepted
+        use std::io::BufRead;
+        use std::io::prelude::*;
+        // below line may fail if first time.
+        if let Ok(file) = open_read_file("hashes", "hashes.txt") {
+            for line in std::io::BufReader::new(file).lines() {
+                if let Ok(line) = line {
+                    if line.eq(hash) {
+                        return HashSubmittion::AlreadyExists 
+                    }
+                }
+            }
         }
+        let mut file = open_append_file("hashes", "hashes.txt")
+            .expect("Could not open data/hashes.txt for writing");
+        let _ = writeln!(file, "{}", hash);
+        HashSubmittion::Accepted
     }
+
+
+    pub fn save_best(&self, best: BestSolution) {
+        let file  = open_overwrite_file("best","best.json",
+            ).expect("Could not open/overwrite best solution file.");
+        serde_json::to_writer(&file, &best)
+            .expect("Counld not write JSON to best solution file");
+    }
+}
+
+fn make_path(path: &str) {
+    let dir_path = format!("{}/{}/{}", get_cwd(), "data", path);
+    let err_msg = format!("could not create directory: {}", dir_path);
+    std::fs::create_dir_all(&dir_path).expect(&err_msg);
+}
+
+fn get_cwd() -> String {
+    let cwd = std::env::current_dir().expect("could not get cwd.");
+    let cwd = cwd.display();
+    format!("{}", cwd)
+}
+
+fn open_append_file(path: &str, filename: &str) -> Result<std::fs::File, std::io::Error> {
+    make_path(path);
+    OpenOptions::new()
+        .create(true)
+        .write(true)
+        .append(true)
+        .open(&format!("{}/data/{}/{}", get_cwd(), path, filename))
+}
+
+fn open_overwrite_file(path: &str, filename: &str) -> Result<std::fs::File, std::io::Error> {
+    make_path(path);
+    OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&format!("{}/data/{}/{}", get_cwd(), path, filename))
+}
+
+fn open_read_file(path: &str, filename: &str) -> Result<std::fs::File, std::io::Error> {
+    make_path(path);
+    OpenOptions::new()
+        .read(true)
+        .open(&format!("{}/data/{}/{}", get_cwd(), path, filename))
 }

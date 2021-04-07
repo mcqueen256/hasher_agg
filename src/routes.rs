@@ -1,58 +1,93 @@
 use std::sync::{Arc, Mutex};
 use sha2::{Digest, Sha256};
 use actix_web::{web, get, post, HttpResponse, Responder, web::Json};
-use crate::{app::{ApplicationData, HashSubmittion, BestSolution}, packets, packets::{Job}};
-use itertools::{Itertools, PeekingNext};
+use crate::{app::{ApplicationData, HashSubmittion, BestSolution, StoredJob}, packets};
 
 type AppData = web::Data<Arc<Mutex<ApplicationData>>>;
 
 const MINIMUN_ZERO_BIT_LENGTH: u8 = 26;
 
 #[get("/")]
-pub async fn hello() -> impl Responder {
+pub async fn index(data: AppData) -> impl Responder {
+    let app = data.lock().unwrap();
 
+    let mut body = String::new();
+    body += "<!DOCTYPE html><html><head></head><body>";
+    if let Some(best) = &app.best {
+        body += &format!("
+            <h1>Best Solution</h1>
+            <p>Leading zero bits length: <b>{}</b></p>
+            <p>Found by: <b>{}</b></p>
+            <p>nounce: <b>{}</b></p>
+            <p>hash: <b>{}</b></p>
+            ",
+            best.leading_zero_bit_length,
+            best.student_number,
+            best.nounce,
+            best.hash,
+        );
+    } else {
+        body += &format!("<h1>No Best Solution Yet<h1>");
+    }
+
+    body += "<h2>Submitters</h2>";
+    let pool_total_shares: usize = app.submitters.iter()
+        .map(|(_student_number, submitter)| submitter.accepted_shares_count as usize)
+        .sum();
+
+    for (student_number, submitter) in app.submitters.iter() {
+        let user_total_shares = submitter.accepted_shares_count as usize;
+        body += &format!("
+            <p>SN: <b>{}</b></p>
+            <p>MH/s: <b>{}</b></p>
+            <p>shares: <b>{}/{}</b></p>
+            <hr />
+            ",
+            student_number,
+            submitter.user_hash_rate() / 1_000_000.0,
+            user_total_shares,
+            pool_total_shares,
+        );
+    }
+    body += "</body>";
     
-    HttpResponse::Ok().body("Hello world!")
-}
-
-#[post("/echo")]
-pub async fn echo(req_body: String) -> impl Responder {
-    HttpResponse::Ok().body(req_body)
+    HttpResponse::Ok()
+    .content_type("text/html")
+    .body(&body)
 }
 
 #[post("/boot")]
 pub async fn boot(data: AppData, boot_request: Json<packets::BootRequest>) -> impl Responder {
-    println!("@/boot");
     let mut app = data.lock().unwrap();
     let submitter = (*app).submitter_from(&boot_request.student_number);
     let machine = submitter.get_machine(&boot_request.name);
     machine.online = true;
+    submitter.save();
     HttpResponse::Ok().json(packets::CommandResponse { ok: true, msg: None })
 }
 
 
 #[post("/shutdown")]
 pub async fn showdown(data: AppData, shutdown_request: Json<packets::ShutdownRequest>) -> impl Responder {
-    println!("@/shutdown");
     let mut app = data.lock().unwrap();
     let submitter = (*app).submitter_from(&shutdown_request.student_number);
     let machine = submitter.get_machine(&shutdown_request.name);
     machine.online = false;
+    submitter.save();
     HttpResponse::Ok().json(packets::CommandResponse { ok: true, msg: None })
 }
 
 #[post("/job/request")]
 pub async fn job_request(data: AppData, job_request: Json<packets::JobRequestPacket>) -> impl Responder {
-    println!("@/job/request");
     let mut app = data.lock().unwrap();
     let submitter = (*app).submitter_from(&job_request.student_number);
     let job = submitter.next_job(&job_request.name);
+    submitter.save();
     HttpResponse::Ok().json(packets::JobResponsePacket::Success(job))
 }
 
 #[post("/job/submit")]
 pub async fn job_submit(data: AppData, submit_request: Json<packets::SubmittionPacket>) -> impl Responder {
-    println!("@/job/submit");
 
     let mut app = data.lock().unwrap();
 
@@ -75,7 +110,6 @@ pub async fn job_submit(data: AppData, submit_request: Json<packets::SubmittionP
 
     // Collect valid & in-valid hashes
     let mut valid_solutions = Vec::new();
-    let mut in_valid_solutions = Vec::new();
     let mut sh = Sha256::default();
     for sol in submit_request.solutions.iter() {
         let buffer = if let Ok(buffer) = hash_to_sha256_buffer(&sol.sha256) { buffer } else {
@@ -110,30 +144,35 @@ pub async fn job_submit(data: AppData, submit_request: Json<packets::SubmittionP
         
         // Submit the hash.
         match app.submit_hash(&sol.sha256) {
-            HashSubmittion::Accepted => valid_solutions.push(sol.clone()),
-            HashSubmittion::AlreadyExists => in_valid_solutions.push(sol.clone()),
+            HashSubmittion::Accepted => {
+                valid_solutions.push((leading_zero_bits, sol.clone()));
+            },
+            HashSubmittion::AlreadyExists => (),
         }
 
         if let Some(current_best) = &app.best {
             if leading_zero_bits > current_best.leading_zero_bit_length {
-                app.best = Some(BestSolution {
+                let best = BestSolution {
                     student_number,
                     job_number: submit_request.job_n,
                     leading_zero_bit_length: leading_zero_bits,
                     hash: sol.sha256.clone(),
                     nounce: sol.nounce.clone(),
     
-                });
+                };
+                app.save_best(best.clone());
+                app.best = Some(best);
             }
         } else {
-            app.best = Some(BestSolution {
+            let best = BestSolution {
                 student_number,
                 job_number: submit_request.job_n,
                 leading_zero_bit_length: leading_zero_bits,
                 hash: sol.sha256.clone(),
                 nounce: sol.nounce.clone(),
-
-            });
+            };
+            app.save_best(best.clone());
+            app.best = Some(best);
         }
     }
 
@@ -147,17 +186,20 @@ pub async fn job_submit(data: AppData, submit_request: Json<packets::SubmittionP
         let nounce_start = submit_request.nounce_end;
         let nounce_end = pending_job.nounce_end;
         let size = nounce_end - nounce_start + 1;
-        submitter.unfinished_jobs.push(Job {
+        submitter.unfinished_jobs.push(StoredJob {
             number,
             size,
             nounce_start,
             nounce_end,
+            quote_time: crate::util::get_time(),
         });
     }
 
     // add Solutions.
-    submitter.accepted_shares.append(&mut valid_solutions);
-    submitter.rejected_shares.append(&mut in_valid_solutions);
+    submitter.accepted_shares_count += valid_solutions.len() as u64;
+    for (leading, solution) in valid_solutions.into_iter() {
+        submitter.save_solution(solution, leading);
+    }
 
     // update machine info: thread hashrate.
     let reported_thread_hashrate = submit_request.thread_hashes_per_second;
@@ -182,10 +224,11 @@ pub async fn job_submit(data: AppData, submit_request: Json<packets::SubmittionP
     machine.reported_total_hashrate = sum / len;
 
     // Recalculate next job size so that it is one minutes worth of work.
-    let hashes_per_minute = machine.reported_thread_hashrate * 60.0;
+    let hashes_per_minute = machine.reported_thread_hashrate * 30.0;
     let next_job_size = max(hashes_per_minute.floor() as u64, 1_000_000);
     machine.calculated_job_size = next_job_size;
 
+    submitter.save();
     HttpResponse::Ok().json(packets::SubmittionResponsePacket::Accepted)
 }
 
@@ -203,16 +246,13 @@ fn sha245_to_string(sha256_buffer: &[u8]) -> String {
 
 #[post("/status")]
 pub async fn pool_status(data: AppData, status_request: Json<packets::PoolStatusRequestPacket>) -> impl Responder {
-    println!("@/status");
     let mut app = data.lock().unwrap();
     let submitter = app.submitter_from(&status_request.student_number);
 
     let user_total_hash_rate = submitter.user_hash_rate();
-    let user_total_shares = submitter.accepted_shares.len();
+    let user_total_shares = submitter.accepted_shares_count as usize;
     let pool_total_shares = app.submitters.iter()
-        .map(|(_student_number, submitter)| {
-            submitter.accepted_shares.len()
-        })
+        .map(|(_student_number, submitter)| submitter.accepted_shares_count as usize)
         .sum();
     let next_job_sum: u64 = app.submitters.iter()
     .map(|(_student_number, submitter)| {
@@ -232,7 +272,6 @@ pub async fn pool_status(data: AppData, status_request: Json<packets::PoolStatus
     } else {
         0
     };
-
 
     let packet = packets::PoolStatusResponsePacket {
         user_total_hash_rate,
@@ -302,4 +341,3 @@ fn count_leading_zero_bits(buffer: &[u8]) -> u8 {
     }
     leading_zero_bits
 }
-

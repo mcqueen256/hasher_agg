@@ -2,11 +2,12 @@
 mod app;
 mod routes;
 mod packets;
+mod util;
 
 use actix_web::{App, HttpServer};
 use actix_web::middleware::Logger;
 use std::sync::{Arc, Mutex};
-use crate::routes::{hello, echo, boot, showdown, job_request, job_submit, pool_status};
+use crate::routes::{index, boot, showdown, job_request, job_submit, pool_status};
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
@@ -19,8 +20,7 @@ async fn main() -> std::io::Result<()> {
     let server = HttpServer::new(move || {
         App::new()
             .data(Arc::clone(&app))
-            .service(hello)
-            .service(echo)
+            .service(index)
             .service(boot)
             .service(showdown)
             .service(job_request)
