@@ -28,7 +28,7 @@ async fn main() -> std::io::Result<()> {
             .service(pool_status)
             .wrap(Logger::default())
     })
-    .bind(("127.0.0.1", 8080))?;
+    .bind(("0.0.0.0", 9876))?;
     let and = server.run();
     and.await
 }
