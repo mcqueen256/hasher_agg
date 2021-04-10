@@ -1,11 +1,10 @@
 use std::sync::{Arc, Mutex};
 use sha2::{Digest, Sha256};
 use actix_web::{web, get, post, HttpResponse, Responder, web::Json};
-use crate::{app::{ApplicationData, HashSubmittion, BestSolution, StoredJob}, packets};
+use crate::{app::{ApplicationData, HashSubmittion, BestSolution}, packets};
+use crate::submitter::StoredJob;
 
 type AppData = web::Data<Arc<Mutex<ApplicationData>>>;
-
-const MINIMUN_ZERO_BIT_LENGTH: u8 = 34;
 
 #[get("/")]
 pub async fn index(data: AppData) -> impl Responder {
@@ -118,7 +117,7 @@ pub async fn job_submit(data: AppData, submit_request: Json<packets::SubmittionP
         };
         let leading_zero_bits = count_leading_zero_bits(&buffer);
         // Check is hash length requirement passes
-        if leading_zero_bits < MINIMUN_ZERO_BIT_LENGTH {
+        if leading_zero_bits < crate::constants::MINIMUN_ZERO_BIT_LENGTH {
             println!("buffer: {:?}", buffer);
             eprintln!("hash length requirement failed: {}", leading_zero_bits);
             continue; // hash length requirement failed.

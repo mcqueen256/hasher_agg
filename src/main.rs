@@ -1,18 +1,20 @@
-
 mod app;
-mod routes;
+mod constants;
 mod packets;
+mod routes;
 mod util;
+mod file_operations;
+mod submitter;
 
-use actix_web::{App, HttpServer};
+use crate::routes::{boot, index, job_request, job_submit, pool_status, showdown};
 use actix_web::middleware::Logger;
+use actix_web::{App, HttpServer};
 use std::sync::{Arc, Mutex};
-use crate::routes::{index, boot, showdown, job_request, job_submit, pool_status};
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     // std::env::set_var("RUST_LOG", "actix_web=info");
-    std::env::set_var("RUST_LOG", "my_errors=debug,actix_web=debug");
+    std::env::set_var("RUST_LOG", "actix_web=debug");
     std::env::set_var("RUST_BACKTRACE", "1");
     env_logger::init();
     let data = Arc::new(Mutex::new(app::ApplicationData::begin()));
